@@ -3,6 +3,7 @@
 # dependencies
 node_modules/
 constants/config.ts
+assets/bibles/*.json
 
 # Expo
 .expo/
