@@ -1,0 +1,4 @@
+export const ESV_API_KEY = 'YOUR_ESV_API_KEY_HERE';
+export const CLAUDE_API_KEY = 'YOUR_CLAUDE_API_KEY_HERE';
+export const GIST_URL = 'YOUR_GIST_URL_HERE';
+export const TRANSLATION_CODE = 'ESV';
