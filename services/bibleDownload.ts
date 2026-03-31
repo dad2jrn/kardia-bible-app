@@ -1,136 +1,145 @@
-import { fetchChapter } from './esvApi';
-import { insertVerses, getChapterCacheStatus, setAppConfig, getAppConfig } from './database';
-import { BIBLE_BOOKS, getTotalChapters } from '../constants/bibleMetadata';
-import { TRANSLATION_CODE } from '../constants/config';
-
-// ─── Types ────────────────────────────────────────────────────────────────────
-
-export type DownloadProgressCallback = (progress: {
-  currentBook: string;
-  currentBookNumber: number;
-  totalBooks: number;
-  currentChapter: number;
-  totalChaptersInBook: number;
-  overallChaptersCompleted: number;
-  overallTotalChapters: number;
-}) => void;
-
-// ─── Constants ────────────────────────────────────────────────────────────────
-
-const INTER_REQUEST_DELAY_MS = 300;
-
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-// ─── Public API ───────────────────────────────────────────────────────────────
-
 /**
- * Downloads all 66 Bible books from the ESV API into the local SQLite database.
+ * bibleDownloadService.ts
  *
- * - Skips chapters that are already fully cached (resumable).
- * - Individual chapter failures are logged and skipped; the overall download continues.
- * - On completion, sets the app config flag 'bible_download_complete' to 'true'.
+ * Orchestration layer between the ESV API batched downloader and SQLite.
+ *
+ * Responsibilities:
+ *   - Query bible_chapter_cache to determine which chapters are pending
+ *   - Drive downloadBibleBatched with onChapterReady / onChapterFailed hooks
+ *   - Write each valid chapter to bible_verses via database.ts
+ *   - Mark chapters complete or failed in bible_chapter_cache
+ *   - Set the global bible_download_complete flag only when fully done
+ *   - Expose a simple surface for the FirstLaunch screen to attach progress UI
+ *
+ * This service does NOT touch the UI. Progress is communicated via callback.
  */
-export async function downloadAllBooks(onProgress: DownloadProgressCallback): Promise<void> {
-  const totalBooks = BIBLE_BOOKS.length;
-  const overallTotalChapters = getTotalChapters();
-  let overallChaptersCompleted = 0;
 
-  for (const book of BIBLE_BOOKS) {
-    for (let chapter = 1; chapter <= book.chapters; chapter++) {
-      // ── Check cache before fetching ────────────────────────────────────────
-      let alreadyCached = false;
-      try {
-        const cacheStatus = await getChapterCacheStatus(TRANSLATION_CODE, book.name, chapter);
-        if (cacheStatus?.is_complete) {
-          alreadyCached = true;
-        }
-      } catch (cacheError) {
-        console.warn(
-          `[bibleDownload] Cache check failed for ${book.name} ${chapter}:`,
-          cacheError,
-        );
-        // Treat as not cached; attempt download
-      }
+import { downloadBibleBatched, ParsedChapter, DownloadProgressEvent, PendingChapter } from './esvApi';
+import { BIBLE_METADATA, getExpectedVerseCount } from '../constants/bibleMetadata';
+import {
+  getPendingChapters,
+  insertChapterVerses,
+  markChapterComplete,
+  markChapterFailed,
+  setBibleDownloadComplete,
+  isBibleDownloadComplete,
+} from './database';
 
-      if (!alreadyCached) {
-        try {
-          const { verses } = await fetchChapter(book.name, chapter);
+export interface DownloadSummary {
+  completed: number;
+  failed: number;
+  alreadyComplete: boolean;
+}
 
-          const verseInputs = verses.map((v) => ({
-            verse: v.verse,
-            book_number: book.book_number,
-            text: v.text,
-            source: 'esv_api',
-          }));
+/**
+ * runBibleDownload
+ *
+ * Entry point called from the FirstLaunch screen (and optionally from
+ * the retry path in Settings).
+ *
+ * @param apiKey     ESV API key from constants/config.ts
+ * @param onProgress Progress callback for UI updates
+ */
+export async function runBibleDownload(
+  apiKey: string,
+  onProgress?: (event: DownloadProgressEvent) => void,
+): Promise<DownloadSummary> {
+  // Fast path: already complete
+  const alreadyDone = await isBibleDownloadComplete();
+  if (alreadyDone) {
+    return { completed: 0, failed: 0, alreadyComplete: true };
+  }
 
-          await insertVerses(TRANSLATION_CODE, book.name, chapter, verseInputs);
+  // Build the pending chapter list from cache state
+  const pendingChapters = await buildPendingChapterList();
 
-          await delay(INTER_REQUEST_DELAY_MS);
-        } catch (downloadError) {
-          console.error(
-            `[bibleDownload] Failed to download ${book.name} ${chapter}:`,
-            downloadError,
-          );
-          // Skip this chapter; it remains incomplete and can be retried later
-        }
-      }
+  if (pendingChapters.length === 0) {
+    // All chapters marked complete — set the global flag and return
+    await setBibleDownloadComplete(true);
+    return { completed: 0, failed: 0, alreadyComplete: true };
+  }
 
-      overallChaptersCompleted += 1;
+  console.log(`[bibleDownload] ${pendingChapters.length} chapters pending download`);
 
-      onProgress({
-        currentBook: book.name,
-        currentBookNumber: book.book_number,
-        totalBooks,
-        currentChapter: chapter,
-        totalChaptersInBook: book.chapters,
-        overallChaptersCompleted,
-        overallTotalChapters,
+  const { completed, failed } = await downloadBibleBatched({
+    apiKey,
+    pendingChapters,
+    onProgress,
+
+    onChapterReady: async (chapter: ParsedChapter) => {
+      // Write all verses for this chapter in one transaction
+      await insertChapterVerses({
+        translationCode: 'ESV',
+        book: chapter.book,
+        bookNumber: chapter.bookNumber,
+        chapter: chapter.chapter,
+        verses: chapter.verses.map(v => ({
+          verse: v.verse,
+          text: v.text,
+        })),
+        expectedVerseCount: getExpectedVerseCount(chapter.book, chapter.chapter) ?? chapter.verses.length,
       });
-    }
+
+      // Mark the chapter complete in cache
+      await markChapterComplete('ESV', chapter.book, chapter.chapter);
+    },
+
+    onChapterFailed: async (book: string, chapter: number, error: string) => {
+      await markChapterFailed('ESV', book, chapter, error);
+    },
+  });
+
+  // Only set the global completion flag when nothing failed
+  if (failed === 0) {
+    await setBibleDownloadComplete(true);
+    console.log('[bibleDownload] Full Bible download complete ✓');
+  } else {
+    console.warn(`[bibleDownload] Download finished with ${failed} failed chapters — not marking complete`);
   }
 
-  try {
-    await setAppConfig('bible_download_complete', 'true');
-  } catch (configError) {
-    console.error('[bibleDownload] Failed to set bible_download_complete config:', configError);
-  }
+  return { completed, failed, alreadyComplete: false };
 }
 
 /**
- * Returns true if the full Bible download has been marked complete.
+ * buildPendingChapterList
+ *
+ * Returns all chapters not yet marked complete in bible_chapter_cache.
+ * On first launch this is all 1,189 chapters.
+ * On resume after a partial failure it is only the failed or never-attempted ones.
  */
-export async function isBibleDownloadComplete(): Promise<boolean> {
-  const value = await getAppConfig('bible_download_complete');
-  return value === 'true';
+async function buildPendingChapterList(): Promise<PendingChapter[]> {
+  // Get the set of completed chapters from the database
+  const completedSet = await getPendingChapters('ESV'); // returns non-complete chapters
+
+  return completedSet;
 }
 
 /**
- * Counts how many chapters have been fully cached so far.
- * Useful for displaying resume progress after an interrupted download.
+ * getDownloadProgress
+ *
+ * Synchronous-friendly summary for the Settings screen to display
+ * download status after the initial launch.
  */
-export async function getDownloadProgress(): Promise<{
+export async function getDownloadStatus(): Promise<{
+  isComplete: boolean;
   completedChapters: number;
   totalChapters: number;
+  failedChapters: number;
 }> {
-  const totalChapters = getTotalChapters();
-  let completedChapters = 0;
+  const isComplete = await isBibleDownloadComplete();
+  const pending = await getPendingChapters('ESV');
 
-  for (const book of BIBLE_BOOKS) {
-    for (let chapter = 1; chapter <= book.chapters; chapter++) {
-      try {
-        const cacheStatus = await getChapterCacheStatus(TRANSLATION_CODE, book.name, chapter);
-        if (cacheStatus?.is_complete) {
-          completedChapters += 1;
-        }
-      } catch {
-        // Treat as incomplete on error
-      }
-    }
-  }
+  const totalChapters = BIBLE_METADATA.reduce((sum, b) => sum + b.chapters.length, 0);
+  const completedChapters = totalChapters - pending.length;
 
-  return { completedChapters, totalChapters };
+  // Count chapters marked as failed specifically
+  // (getPendingChapters returns all non-complete; failed is a subset)
+  const failedChapters = pending.filter(p => p.isFailed).length;
+
+  return {
+    isComplete,
+    completedChapters,
+    totalChapters,
+    failedChapters,
+  };
 }
