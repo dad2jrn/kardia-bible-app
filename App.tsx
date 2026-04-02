@@ -14,7 +14,17 @@ import {
 } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
 
-import { initializeDatabase, removeTranslationData, getChapterVerses, type BibleVerse } from './services/database';
+import {
+  initializeDatabase,
+  removeTranslationData,
+  getChapterVerses,
+  type BibleVerse,
+  type KardiaTranslationRecord,
+  sanitizeKardiaTranslations,
+} from './services/database';
+import type { KeyTermDetails } from './types/kardia';
+import { getOrCreateKardiaTranslation } from './services/kardiaTranslator';
+import { looksLikeKardiaJson, parseKardiaJson } from './services/kardiaParser';
 import {
   importBibleFromJson,
   isBibleImportComplete,
@@ -41,6 +51,16 @@ interface TranslationOption {
   description?: string;
   loadData: () => Record<string, unknown>;
 }
+
+interface KardiaRequestContext {
+  sourceTranslationCode: string;
+  book: string;
+  chapter: number;
+  verse: number;
+  sourceText: string;
+}
+
+type KardiaModalStatus = 'idle' | 'loading' | 'success' | 'error';
 
 const TRANSLATIONS: TranslationOption[] = [
   {
@@ -92,6 +112,81 @@ export default function App() {
   const [pickerBookIndex, setPickerBookIndex] = useState<number | null>(null);
   const [pickerTestament, setPickerTestament] = useState<'ot' | 'nt'>('ot');
   const [isTranslationModalVisible, setTranslationModalVisible] = useState(false);
+  const [isKardiaModalVisible, setKardiaModalVisible] = useState(false);
+  const [kardiaContext, setKardiaContext] = useState<KardiaRequestContext | null>(null);
+  const [kardiaStatus, setKardiaStatus] = useState<KardiaModalStatus>('idle');
+  const [kardiaRecord, setKardiaRecord] = useState<KardiaTranslationRecord | null>(null);
+  const [kardiaError, setKardiaError] = useState<string | null>(null);
+  const parsedKeyTerm = useMemo<KeyTermDetails | null>(() => {
+    if (!kardiaRecord?.key_term_notes) {
+      return null;
+    }
+    try {
+      const parsed = JSON.parse(kardiaRecord.key_term_notes) as KeyTermDetails;
+      if (parsed && (parsed.term || parsed.notes)) {
+        return parsed;
+      }
+    } catch {
+      return null;
+    }
+    return null;
+  }, [kardiaRecord]);
+  const parsedExtraNotes = useMemo<string[]>(() => {
+    if (!kardiaRecord?.extra_notes) {
+      return [];
+    }
+    try {
+      const notes = JSON.parse(kardiaRecord.extra_notes) as unknown;
+      if (Array.isArray(notes)) {
+        return notes
+          .filter((note): note is string => typeof note === 'string' && note.trim().length > 0)
+          .map((note) => note.trim());
+      }
+    } catch {
+      return [];
+    }
+    return [];
+  }, [kardiaRecord]);
+  const legacyParsedPayload = useMemo(() => {
+    const sourceJson =
+      kardiaRecord?.kardia_text && looksLikeKardiaJson(kardiaRecord.kardia_text)
+        ? kardiaRecord.kardia_text
+        : kardiaRecord?.raw_response_json && looksLikeKardiaJson(kardiaRecord.raw_response_json)
+          ? kardiaRecord.raw_response_json
+          : null;
+    if (!sourceJson) {
+      return null;
+    }
+    return parseKardiaJson(sourceJson);
+  }, [kardiaRecord]);
+  const effectiveSourceText =
+    legacyParsedPayload?.sourceText ??
+    kardiaRecord?.source_text ??
+    kardiaContext?.sourceText ??
+    '';
+  const effectiveKardiaText = legacyParsedPayload?.kardiaText ?? kardiaRecord?.kardia_text ?? '';
+  const effectiveKeyTerm = legacyParsedPayload?.keyTerm
+    ? {
+        term: legacyParsedPayload.keyTerm.term ?? null,
+        notes: legacyParsedPayload.keyTerm.notes ?? null,
+      }
+    : parsedKeyTerm;
+  const effectiveHebrewWord =
+    legacyParsedPayload?.hebrewWord ??
+    legacyParsedPayload?.keyTerm?.hebrew ??
+    kardiaRecord?.hebrew_word ??
+    null;
+  const effectiveHebrewCategory =
+    legacyParsedPayload?.hebrewCategory ?? kardiaRecord?.hebrew_category ?? null;
+  const effectiveWhyThisMatters =
+    legacyParsedPayload?.whyThisMatters ?? kardiaRecord?.why_this_matters ?? null;
+  const effectiveExtraNotes = legacyParsedPayload?.extraNotes ?? parsedExtraNotes;
+  const hasKeyTermCard = Boolean(effectiveKeyTerm?.term || effectiveHebrewWord);
+  const hasInsights =
+    Boolean(effectiveKeyTerm?.notes) ||
+    Boolean(effectiveHebrewCategory) ||
+    Boolean(effectiveWhyThisMatters) ||
+    effectiveExtraNotes.length > 0;
 
   const installedTranslations = useMemo(
     () => TRANSLATIONS.filter((option) => translationStatuses[option.code] === 'installed'),
@@ -110,8 +205,9 @@ export default function App() {
   const initialize = useCallback(async () => {
     setPhase('loading');
     try {
-      await initializeDatabase();
-      const complete = await isBibleImportComplete();
+      initializeDatabase();
+      sanitizeKardiaTranslations();
+      const complete = isBibleImportComplete();
       const activeCode = complete ? TRANSLATION_CODE : null;
       setTranslationStatuses(buildStatusMap(activeCode, complete));
       setActiveTranslationCode(activeCode);
@@ -326,6 +422,55 @@ export default function App() {
     [],
   );
 
+  const loadKardiaTranslation = useCallback(async (context: KardiaRequestContext) => {
+    setKardiaStatus('loading');
+    setKardiaError(null);
+    setKardiaRecord(null);
+    try {
+      const record = await getOrCreateKardiaTranslation(context);
+      setKardiaRecord(record);
+      setKardiaStatus('success');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to generate translation.';
+      setKardiaError(message);
+      setKardiaStatus('error');
+    }
+  }, []);
+
+  const handleVersePress = useCallback(
+    (verseItem: BibleVerse) => {
+      if (!activeTranslationCode) {
+        return;
+      }
+      const bookMeta = BIBLE_BOOKS[selectedBookIndex] ?? BIBLE_BOOKS[0];
+      const context: KardiaRequestContext = {
+        sourceTranslationCode: activeTranslationCode,
+        book: bookMeta.name,
+        chapter: selectedChapter,
+        verse: verseItem.verse,
+        sourceText: verseItem.text,
+      };
+      setKardiaContext(context);
+      setKardiaModalVisible(true);
+      loadKardiaTranslation(context);
+    },
+    [activeTranslationCode, selectedBookIndex, selectedChapter, loadKardiaTranslation],
+  );
+
+  const closeKardiaModal = useCallback(() => {
+    setKardiaModalVisible(false);
+    setKardiaContext(null);
+    setKardiaRecord(null);
+    setKardiaStatus('idle');
+    setKardiaError(null);
+  }, []);
+
+  const retryKardiaTranslation = useCallback(() => {
+    if (kardiaContext) {
+      loadKardiaTranslation(kardiaContext);
+    }
+  }, [kardiaContext, loadKardiaTranslation]);
+
   const openTranslationModal = useCallback(() => {
     setTranslationModalVisible(true);
   }, []);
@@ -427,10 +572,10 @@ export default function App() {
               data={verses}
               keyExtractor={(item) => String(item.verse)}
               renderItem={({ item }) => (
-                <View style={styles.verseRow}>
+                <TouchableOpacity style={styles.verseRow} onPress={() => handleVersePress(item)}>
                   <Text style={styles.verseNumber}>{item.verse}</Text>
                   <Text style={styles.verseText}>{item.text}</Text>
-                </View>
+                </TouchableOpacity>
               )}
               contentContainerStyle={styles.verseListContent}
             />
@@ -682,6 +827,107 @@ export default function App() {
     );
   };
 
+  const renderKardiaModal = () => {
+    const reference = kardiaContext ? `${kardiaContext.book} ${kardiaContext.chapter}:${kardiaContext.verse}` : '';
+    return (
+      <Modal
+        animationType="slide"
+        transparent
+        visible={isKardiaModalVisible}
+        onRequestClose={closeKardiaModal}
+      >
+        <View style={styles.modalBackdrop}>
+          <View style={styles.modalContainer}>
+            <View style={styles.modalHeader}>
+              <TouchableOpacity onPress={closeKardiaModal}>
+                <Text style={styles.modalAction}>Close</Text>
+              </TouchableOpacity>
+              <Text style={styles.modalTitle}>Kardia translation</Text>
+              <View style={{ width: 60 }} />
+            </View>
+            {reference ? <Text style={styles.kardiaModalReference}>{reference}</Text> : null}
+            {kardiaStatus === 'loading' ? (
+              <View style={styles.kardiaModalState}>
+                <ActivityIndicator size="large" color="#333" />
+                <Text style={styles.kardiaModalStateText}>Loading...</Text>
+              </View>
+            ) : null}
+            {kardiaStatus === 'error' ? (
+              <View style={styles.kardiaModalState}>
+                <Text style={styles.errorText}>{kardiaError ?? 'Failed to load translation.'}</Text>
+                <TouchableOpacity style={styles.button} onPress={retryKardiaTranslation}>
+                  <Text style={styles.buttonText}>Retry</Text>
+                </TouchableOpacity>
+              </View>
+            ) : null}
+            {kardiaStatus === 'success' && kardiaRecord ? (
+              <ScrollView style={styles.kardiaModalScroll} contentContainerStyle={styles.kardiaModalContent}>
+                {effectiveSourceText ? (
+                  <View style={styles.translationCard}>
+                    <Text style={styles.translationCardLabel}>
+                      {kardiaContext?.sourceTranslationCode ?? kardiaRecord.source_translation_code} · Original
+                    </Text>
+                    <Text style={styles.translationCardBody}>{effectiveSourceText}</Text>
+                  </View>
+                ) : null}
+                <View style={styles.translationCard}>
+                  <Text style={styles.translationCardLabel}>Kardia Translation</Text>
+                  <Text style={styles.kardiaTranslationText}>
+                    {effectiveKardiaText || 'No translation available yet.'}
+                  </Text>
+                </View>
+                {hasKeyTermCard ? (
+                  <View style={styles.translationCard}>
+                    <Text style={styles.translationCardLabel}>Key Term</Text>
+                    {effectiveKeyTerm?.term ? (
+                      <Text style={styles.kardiaKeyTermTerm}>{effectiveKeyTerm.term}</Text>
+                    ) : null}
+                    {effectiveHebrewWord ? (
+                      <Text style={styles.kardiaKeyTermHebrew}>{effectiveHebrewWord}</Text>
+                    ) : null}
+                  </View>
+                ) : null}
+                {hasInsights ? (
+                  <View style={styles.translationCard}>
+                    <Text style={styles.translationCardLabel}>Insights</Text>
+                    {effectiveKeyTerm?.notes ? (
+                      <View style={styles.insightBlock}>
+                        <Text style={styles.insightTitle}>Notes</Text>
+                        <Text style={styles.kardiaModalBodyText}>{effectiveKeyTerm.notes}</Text>
+                      </View>
+                    ) : null}
+                    {effectiveHebrewCategory ? (
+                      <View style={styles.insightBlock}>
+                        <Text style={styles.insightTitle}>Hebrew Category</Text>
+                        <Text style={styles.kardiaModalBodyText}>{effectiveHebrewCategory}</Text>
+                      </View>
+                    ) : null}
+                    {effectiveWhyThisMatters ? (
+                      <View style={styles.insightBlock}>
+                        <Text style={styles.insightTitle}>Why this matters</Text>
+                        <Text style={styles.kardiaModalBodyText}>{effectiveWhyThisMatters}</Text>
+                      </View>
+                    ) : null}
+                    {effectiveExtraNotes.length > 0 ? (
+                      <View style={styles.insightBlock}>
+                        <Text style={styles.insightTitle}>Extra notes</Text>
+                        {effectiveExtraNotes.map((note, index) => (
+                          <Text key={`${note}-${index}`} style={styles.kardiaExtraNote}>
+                            • {note}
+                          </Text>
+                        ))}
+                      </View>
+                    ) : null}
+                  </View>
+                ) : null}
+              </ScrollView>
+            ) : null}
+          </View>
+        </View>
+      </Modal>
+    );
+  };
+
   if (phase === 'loading') {
     return (
       <View style={styles.centeredContent}>
@@ -725,6 +971,7 @@ export default function App() {
       </View>
       {renderBookPickerModal()}
       {renderTranslationModal()}
+      {renderKardiaModal()}
     </SafeAreaView>
   );
 }
@@ -1093,6 +1340,84 @@ const styles = StyleSheet.create({
     fontSize: 15,
     color: '#111',
     fontWeight: '600',
+  },
+  kardiaModalReference: {
+    fontSize: 14,
+    color: '#555',
+    marginBottom: 12,
+  },
+  kardiaModalState: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  kardiaModalStateText: {
+    marginTop: 12,
+    fontSize: 15,
+    color: '#555',
+  },
+  kardiaModalScroll: {
+    flex: 1,
+  },
+  kardiaModalContent: {
+    paddingBottom: 24,
+  },
+  translationCard: {
+    padding: 16,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#eee',
+    marginBottom: 16,
+    backgroundColor: '#fff',
+  },
+  translationCardLabel: {
+    fontSize: 13,
+    color: '#777',
+    textTransform: 'uppercase',
+    letterSpacing: 0.6,
+    marginBottom: 8,
+  },
+  translationCardBody: {
+    fontSize: 16,
+    lineHeight: 24,
+    color: '#222',
+  },
+  kardiaTranslationText: {
+    fontSize: 18,
+    lineHeight: 26,
+    color: '#111',
+  },
+  kardiaModalBodyText: {
+    marginTop: 4,
+    fontSize: 15,
+    lineHeight: 22,
+    color: '#333',
+  },
+  kardiaKeyTermTerm: {
+    fontSize: 17,
+    color: '#111',
+    fontWeight: '600',
+  },
+  kardiaKeyTermHebrew: {
+    fontSize: 16,
+    color: '#333',
+    marginTop: 4,
+  },
+  insightBlock: {
+    marginTop: 12,
+  },
+  insightTitle: {
+    fontSize: 13,
+    color: '#666',
+    textTransform: 'uppercase',
+    letterSpacing: 0.5,
+    marginBottom: 6,
+  },
+  kardiaExtraNote: {
+    fontSize: 14,
+    color: '#333',
+    marginTop: 6,
+    lineHeight: 20,
   },
   modalSectionLabel: {
     fontSize: 13,

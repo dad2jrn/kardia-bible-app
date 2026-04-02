@@ -115,7 +115,7 @@ export async function importBibleFromJson(
       }));
 
       try {
-        await insertVerses({
+        insertVerses({
           translationCode,
           book: book.name,
           bookNumber: book.bookNumber,
@@ -148,7 +148,7 @@ export async function importBibleFromJson(
 
   if (skippedBooks === 0) {
     try {
-      await setAppConfig('bible_download_complete', 'true');
+      setAppConfig('bible_download_complete', 'true');
     } catch (error) {
       console.error('[bibleImport] Failed to set completion flag:', error);
     }
@@ -159,7 +159,6 @@ export async function importBibleFromJson(
   return { booksImported, chaptersImported, versesImported, warnings };
 }
 
-export async function isBibleImportComplete(): Promise<boolean> {
-  const value = await getAppConfig('bible_download_complete');
-  return value === 'true';
+export function isBibleImportComplete(): boolean {
+  return getAppConfig('bible_download_complete') === 'true';
 }

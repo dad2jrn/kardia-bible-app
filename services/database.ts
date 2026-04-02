@@ -1,7 +1,8 @@
 import * as SQLite from 'expo-sqlite';
 
 import { BIBLE_METADATA } from '../constants/bibleMetadata';
-import type { PendingChapter } from './esvApi';
+import type { KeyTermDetails } from '../types/kardia';
+import { looksLikeKardiaJson, parseKardiaJson } from './kardiaParser';
 
 export interface BibleVerse {
   translation_code: string;
@@ -19,6 +20,44 @@ export interface VerseInput {
   text: string;
 }
 
+export interface KardiaTranslationRecord {
+  source_translation_code: string;
+  book: string;
+  chapter: number;
+  verse: number;
+  source_text: string | null;
+  kardia_text: string | null;
+  hebrew_word: string | null;
+  hebrew_category: string | null;
+  why_this_matters: string | null;
+  kardia_version: string | null;
+  generation_status: string | null;
+  last_error: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+  key_term_notes: string | null;
+  extra_notes: string | null;
+  raw_response_json: string | null;
+}
+
+export interface SaveKardiaTranslationParams {
+  sourceTranslationCode: string;
+  book: string;
+  chapter: number;
+  verse: number;
+  sourceText: string;
+  kardiaText: string;
+  hebrewWord?: string | null;
+  hebrewCategory?: string | null;
+  whyThisMatters?: string | null;
+  kardiaVersion?: string | null;
+  generationStatus?: string | null;
+  lastError?: string | null;
+  keyTermDetails?: KeyTermDetails | null;
+  extraNotes?: string[] | null;
+  rawResponseJson?: string | null;
+}
+
 export interface InsertChapterParams {
   translationCode: string;
   book: string;
@@ -27,6 +66,15 @@ export interface InsertChapterParams {
   verses: VerseInput[];
   expectedVerseCount: number;
   source?: string;
+}
+
+export interface PendingChapter {
+  translationCode: string;
+  book: string;
+  bookNumber: number;
+  chapter: number;
+  expectedVerseCount: number;
+  isFailed: boolean;
 }
 
 export type PendingChapterRecord = PendingChapter;
@@ -73,6 +121,9 @@ const CREATE_TABLES_SQL = [
       last_error TEXT,
       created_at DATETIME,
       updated_at DATETIME,
+      key_term_notes TEXT,
+      extra_notes TEXT,
+      raw_response_json TEXT,
       UNIQUE(source_translation_code, book, chapter, verse)
     )`,
   `CREATE TABLE IF NOT EXISTS word_recovery_log (
@@ -105,6 +156,7 @@ export function initializeDatabase(): void {
     for (const sql of CREATE_TABLES_SQL) {
       db!.execSync(sql);
     }
+    ensureKardiaTranslationSchema(db!);
   });
 }
 
@@ -117,6 +169,20 @@ function getDbOrThrow(): SQLite.SQLiteDatabase {
 
 function now(): string {
   return new Date().toISOString();
+}
+
+function ensureKardiaTranslationSchema(database: SQLite.SQLiteDatabase): void {
+  const columns = database.getAllSync<{ name: string }>('PRAGMA table_info(kardia_translations)');
+  const names = new Set(columns.map((col) => col.name));
+  if (!names.has('key_term_notes')) {
+    database.execSync('ALTER TABLE kardia_translations ADD COLUMN key_term_notes TEXT');
+  }
+  if (!names.has('extra_notes')) {
+    database.execSync('ALTER TABLE kardia_translations ADD COLUMN extra_notes TEXT');
+  }
+  if (!names.has('raw_response_json')) {
+    database.execSync('ALTER TABLE kardia_translations ADD COLUMN raw_response_json TEXT');
+  }
 }
 
 export function getPendingChapters(translationCode: string): PendingChapterRecord[] {
@@ -261,6 +327,164 @@ export function removeTranslationData(translationCode: string): void {
     database.runSync('DELETE FROM kardia_translations WHERE source_translation_code = ?', [translationCode]);
   });
   setBibleDownloadComplete(false);
+}
+
+export function clearAllKardiaTranslations(): void {
+  const database = getDbOrThrow();
+  database.runSync('DELETE FROM kardia_translations');
+}
+
+export function sanitizeKardiaTranslations(): void {
+  const database = getDbOrThrow();
+  const rows = database.getAllSync<{
+    source_translation_code: string;
+    book: string;
+    chapter: number;
+    verse: number;
+    kardia_text: string | null;
+    source_text: string | null;
+    hebrew_word: string | null;
+    hebrew_category: string | null;
+    why_this_matters: string | null;
+    key_term_notes: string | null;
+    extra_notes: string | null;
+    raw_response_json: string | null;
+  }>(
+    `SELECT source_translation_code, book, chapter, verse, kardia_text, source_text, hebrew_word,
+            hebrew_category, why_this_matters, key_term_notes, extra_notes, raw_response_json
+       FROM kardia_translations`,
+  );
+
+  database.withTransactionSync(() => {
+    for (const row of rows) {
+      const sourceJson =
+        row.kardia_text && looksLikeKardiaJson(row.kardia_text) ? row.kardia_text : row.raw_response_json;
+      if (!sourceJson || !looksLikeKardiaJson(sourceJson)) {
+        continue;
+      }
+      const parsed = parseKardiaJson(sourceJson);
+      if (!parsed) {
+        continue;
+      }
+      const updatedSourceText = parsed.sourceText ?? row.source_text ?? null;
+      const updatedHebrewWord = parsed.hebrewWord ?? row.hebrew_word ?? null;
+      const updatedCategory = parsed.hebrewCategory ?? row.hebrew_category ?? null;
+      const updatedWhy = parsed.whyThisMatters ?? row.why_this_matters ?? null;
+      const updatedKeyTerm =
+        parsed.keyTerm && (parsed.keyTerm.term || parsed.keyTerm.notes)
+          ? JSON.stringify({
+              term: parsed.keyTerm.term ?? null,
+              notes: parsed.keyTerm.notes ?? null,
+            })
+          : row.key_term_notes ?? null;
+      const updatedExtraNotes =
+        parsed.extraNotes && parsed.extraNotes.length > 0
+          ? JSON.stringify(parsed.extraNotes)
+          : row.extra_notes ?? null;
+
+      database.runSync(
+        `UPDATE kardia_translations
+            SET kardia_text = ?,
+                source_text = ?,
+                hebrew_word = ?,
+                hebrew_category = ?,
+                why_this_matters = ?,
+                key_term_notes = ?,
+                extra_notes = ?,
+                raw_response_json = ?
+          WHERE source_translation_code = ? AND book = ? AND chapter = ? AND verse = ?`,
+        [
+          parsed.kardiaText,
+          updatedSourceText,
+          updatedHebrewWord,
+          updatedCategory,
+          updatedWhy,
+          updatedKeyTerm,
+          updatedExtraNotes,
+          sourceJson,
+          row.source_translation_code,
+          row.book,
+          row.chapter,
+          row.verse,
+        ],
+      );
+    }
+  });
+}
+
+export interface KardiaTranslationKey {
+  sourceTranslationCode: string;
+  book: string;
+  chapter: number;
+  verse: number;
+}
+
+export function getKardiaTranslation(key: KardiaTranslationKey): KardiaTranslationRecord | null {
+  const database = getDbOrThrow();
+  const row = database.getFirstSync<KardiaTranslationRecord>(
+    `SELECT source_translation_code, book, chapter, verse, source_text, kardia_text, hebrew_word, hebrew_category,
+            why_this_matters, kardia_version, generation_status, last_error, created_at, updated_at,
+            key_term_notes, extra_notes, raw_response_json
+       FROM kardia_translations
+       WHERE source_translation_code = ? AND book = ? AND chapter = ? AND verse = ?`,
+    [key.sourceTranslationCode, key.book, key.chapter, key.verse],
+  );
+  return row ?? null;
+}
+
+export function saveKardiaTranslation(params: SaveKardiaTranslationParams): KardiaTranslationRecord {
+  const database = getDbOrThrow();
+  const timestamp = now();
+  database.runSync(
+    `INSERT INTO kardia_translations
+       (source_translation_code, book, chapter, verse, source_text, kardia_text, hebrew_word, hebrew_category,
+        why_this_matters, kardia_version, generation_status, last_error, created_at, updated_at, key_term_notes, extra_notes, raw_response_json)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(source_translation_code, book, chapter, verse)
+     DO UPDATE SET
+       source_text = excluded.source_text,
+       kardia_text = excluded.kardia_text,
+       hebrew_word = excluded.hebrew_word,
+       hebrew_category = excluded.hebrew_category,
+       why_this_matters = excluded.why_this_matters,
+       kardia_version = excluded.kardia_version,
+       generation_status = excluded.generation_status,
+       last_error = excluded.last_error,
+       updated_at = excluded.updated_at,
+       key_term_notes = excluded.key_term_notes,
+       extra_notes = excluded.extra_notes,
+       raw_response_json = excluded.raw_response_json`,
+    [
+      params.sourceTranslationCode,
+      params.book,
+      params.chapter,
+      params.verse,
+      params.sourceText,
+      params.kardiaText,
+      params.hebrewWord ?? null,
+      params.hebrewCategory ?? null,
+      params.whyThisMatters ?? null,
+      params.kardiaVersion ?? null,
+      params.generationStatus ?? null,
+      params.lastError ?? null,
+      timestamp,
+      timestamp,
+      params.keyTermDetails ? JSON.stringify(params.keyTermDetails) : null,
+      params.extraNotes ? JSON.stringify(params.extraNotes) : null,
+      params.rawResponseJson ?? null,
+    ],
+  );
+  const record =
+    getKardiaTranslation({
+      sourceTranslationCode: params.sourceTranslationCode,
+      book: params.book,
+      chapter: params.chapter,
+      verse: params.verse,
+    }) ?? null;
+  if (!record) {
+    throw new Error('Failed to persist Kardia translation.');
+  }
+  return record;
 }
 
 export function getChapterVerses(
